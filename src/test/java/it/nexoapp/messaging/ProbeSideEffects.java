@@ -8,6 +8,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -48,6 +49,8 @@ public class ProbeSideEffects {
     private final Map<UUID, List<Handled>> handled = new ConcurrentHashMap<>();
     private final Map<UUID, Surroundings> surroundings = new ConcurrentHashMap<>();
     private final Map<String, Consumer<EventEnvelope>> handlers = new ConcurrentHashMap<>();
+    private final Set<UUID> deadLettered = ConcurrentHashMap.newKeySet();
+    private final Map<UUID, Set<String>> headerNames = new ConcurrentHashMap<>();
 
     // -----------------------------------------------------------------------------------------------------------------
 
@@ -123,12 +126,61 @@ public class ProbeSideEffects {
     // -----------------------------------------------------------------------------------------------------------------
 
     /**
+     * Records that a message arrived on the dead-letter queue.
+     *
+     * @param messageId id of the dead-lettered message
+     */
+    public void deadLettered(final UUID messageId) {
+        deadLettered.add(messageId);
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Tells whether a message arrived on the dead-letter queue.
+     *
+     * @param messageId message id
+     * @return true when the message was dead-lettered
+     */
+    public boolean isDeadLettered(final UUID messageId) {
+        return deadLettered.contains(messageId);
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Records the AMQP header names a delivered message carried.
+     *
+     * @param messageId message id
+     * @param names     header names
+     */
+    public void headers(final UUID messageId, final Set<String> names) {
+        headerNames.put(messageId, Set.copyOf(names));
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * AMQP header names recorded for a message.
+     *
+     * @param messageId message id
+     * @return the header names, null when the message was not delivered to the header consumer
+     */
+    public Set<String> headersFor(final UUID messageId) {
+        return headerNames.get(messageId);
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+
+    /**
      * Forgets everything recorded and every registered handler.
      */
     public void reset() {
         handled.clear();
         surroundings.clear();
         handlers.clear();
+        deadLettered.clear();
+        headerNames.clear();
     }
 
 }

@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.time.OffsetDateTime;
+import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -47,6 +48,12 @@ class OutboxInboxTest {
 
     @Inject
     EntityManager em;
+
+    @Inject
+    EnvelopeCodec codec;
+
+    @Inject
+    ProbeSender sender;
 
     // -----------------------------------------------------------------------------------------------------------------
 
@@ -221,6 +228,131 @@ class OutboxInboxTest {
         assertEquals(0, calls.get());
         assertEquals(0, inboxCount(envelope.messageId()));
         assertNull(MDCUtils.get(MDCConstant.ASSOCIATION_ID));
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Builds an envelope of the given type for the raw sender.
+     *
+     * @param type   envelope type, the routing key is configured on the sender channel
+     * @param tenant tenant of the envelope, may be null
+     * @return a new envelope
+     */
+    private static EventEnvelope rawEnvelope(final String type, final UUID tenant) {
+        return new EventEnvelope(UUID.randomUUID(), type, 1, tenant, "call-raw-1", "system:other",
+                OffsetDateTime.now(), "{}");
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * The same envelope bytes delivered twice by the broker are handled once: one handler call and one inbox row. A
+     * later sentinel message proves the consumer already went through the second delivery (the consumer is serial).
+     */
+    @Test
+    void redeliveredEnvelopeIsHandledExactlyOnce() {
+        final EventEnvelope duplicate = rawEnvelope("probe.dup", TENANT_A);
+        final byte[] bytes = codec.encode(duplicate);
+
+        sender.send(bytes);
+        sender.send(bytes);
+        final EventEnvelope sentinel = rawEnvelope("probe.dup", TENANT_A);
+        sender.send(codec.encode(sentinel));
+
+        Awaitility.await().atMost(Duration.ofSeconds(15))
+                .untilAsserted(() -> assertNotNull(sideEffects.surroundingsFor(sentinel.messageId())));
+        // one more consumer cycle after the sentinel, then the counts must still be 1
+        Awaitility.await().pollDelay(Duration.ofSeconds(1)).atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertEquals(1, sideEffects.handledFor(duplicate.messageId()).size()));
+
+        assertEquals(1, sideEffects.handledFor(duplicate.messageId()).size());
+        assertEquals(1, inboxCount(duplicate.messageId()));
+        assertEquals(1, sideEffects.handledFor(sentinel.messageId()).size());
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * A handler failure rolls the inbox row back and the message ends on the dead-letter queue.
+     */
+    @Test
+    void failingHandlerLeavesNoInboxRowAndTheMessageIsDeadLettered() {
+        sideEffects.register("probe.fail", e -> {
+            throw new IllegalStateException("handler failure");
+        });
+        final EventEnvelope failing = rawEnvelope("probe.fail", TENANT_A);
+
+        sender.send(codec.encode(failing));
+
+        Awaitility.await().atMost(Duration.ofSeconds(15))
+                .untilAsserted(() -> assertTrue(sideEffects.isDeadLettered(failing.messageId())));
+        assertEquals(1, sideEffects.handledFor(failing.messageId()).size());
+        assertEquals(0, inboxCount(failing.messageId()));
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * An envelope without tenant is never handled, leaves no inbox row and is dead-lettered.
+     */
+    @Test
+    void envelopeWithoutTenantIsNeverHandledAndIsDeadLettered() {
+        final EventEnvelope tenantless = rawEnvelope("probe.dup", null);
+
+        sender.send(codec.encode(tenantless));
+
+        Awaitility.await().atMost(Duration.ofSeconds(15))
+                .untilAsserted(() -> assertTrue(sideEffects.isDeadLettered(tenantless.messageId())));
+        assertTrue(sideEffects.handledFor(tenantless.messageId()).isEmpty());
+        assertEquals(0, inboxCount(tenantless.messageId()));
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * An event published in a transaction that rolls back is never delivered: nothing reaches the consumer and no
+     * outbox row remains. A later committed event proves the relay and the consumer kept running.
+     */
+    @Test
+    void rolledBackPublishIsNeverDelivered() {
+        final UUID[] rolledBack = new UUID[1];
+        assertThrows(IllegalStateException.class, () -> TenantContext.runAs(TENANT_A, () ->
+                QuarkusTransaction.requiringNew().run(() -> {
+                    rolledBack[0] = publisher.publish("probe.created", 1, payload());
+                    throw new IllegalStateException("rollback");
+                })));
+
+        final UUID committed = TenantContext.callAs(TENANT_A, () -> QuarkusTransaction.requiringNew()
+                .call(() -> publisher.publish("probe.created", 1, payload())));
+        Awaitility.await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertNotNull(sideEffects.surroundingsFor(committed)));
+
+        assertNotNull(rolledBack[0]);
+        assertTrue(sideEffects.handledFor(rolledBack[0]).isEmpty());
+        assertEquals(0, inboxCount(rolledBack[0]));
+        assertNull(scalar("outbox", "id", "id", rolledBack[0]));
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * The application headers of a delivered message are exactly the four ids; only broker-added headers may come in
+     * addition. No header carries personal data.
+     */
+    @Test
+    void deliveredMessageCarriesOnlyTheIdHeaders() {
+        final UUID id = TenantContext.callAs(TENANT_A, () -> QuarkusTransaction.requiringNew()
+                .call(() -> publisher.publish("headers.probe", 1, payload())));
+
+        Awaitility.await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertNotNull(sideEffects.headersFor(id)));
+
+        final Set<String> applicationHeaders = new HashSet<>(sideEffects.headersFor(id));
+        applicationHeaders.removeIf(name -> name.startsWith("x-death") || name.startsWith("x-first-death")
+                || name.startsWith("x-last-death") || name.startsWith("x-opt-") || name.equals("x-delivery-count")
+                || name.equals("x-received-from"));
+        assertEquals(Set.of("x-message-id", "x-message-type", "x-tenant-id", "x-call-id"), applicationHeaders);
     }
 
 }
