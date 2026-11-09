@@ -171,3 +171,46 @@ prefer ids over personal data. `OutboxInboxTest` asserts the exact header set.
 
 The relay is scheduled by elapsed interval (`every`), not by wall-clock cron, and every instant is stored as
 `TIMESTAMPTZ`. A daylight saving change cannot skip, double or reorder relay runs.
+
+## Scheduled jobs
+
+A scheduled job runs on a scheduler thread with no HTTP request, so it must declare the tenant itself. Use
+`TenantJobRunner` (library package `job`): the job iterates the tenants explicitly and calls `runForTenant` (or
+`callForTenant` to return a value) once per tenant.
+
+```java
+@ApplicationScoped
+@RequiredArgsConstructor
+class DigestJob {
+
+    private final TenantJobRunner runner;
+    private final AssociationDirectory associations;
+
+    @Scheduled(identity = "digest", every = "5m", concurrentExecution = Scheduled.ConcurrentExecution.SKIP)
+    void tick() {
+        for (final UUID tenant : associations.tenantIds()) {
+            runner.runForTenant("digest", tenant, () -> { /* tenant-scoped work */ });
+        }
+    }
+}
+```
+
+What the runner guarantees, the same as for consumers:
+
+- the work runs inside `TenantContext` of that tenant, with `system:<app.code>` as audit actor (so `created_by` of every
+  row it writes is `system:<app.code>`), a new random `CALL_ID` per run and `ASSOCIATION_ID` in the logging context;
+- all of them are set BEFORE one new transaction opens for the work, because Hibernate resolves the tenant when the
+  session opens, and they are restored in `finally` (previous logging values are put back, not just removed);
+- a null tenant throws `IllegalArgumentException` and a call inside `runUnscoped` throws `IllegalStateException`; the
+  work does not run in either case.
+
+Rules for jobs:
+
+- Never open a transaction (or a `@Transactional` method) before calling the runner; the runner opens it.
+- The job method that reads the tenant list runs outside any tenant: read it through a global/unscoped path (for example
+  `TenantContext.callUnscoped` in the owning service), never through tenant-filtered repositories.
+- Phase 1 schedules use `every` (elapsed interval) only; no cron expression and no wall-clock comparison exists.
+
+Daylight saving time: because the jobs are interval-scheduled and instants are `TIMESTAMPTZ`, the 2026-03-29 and
+2026-10-25 transitions cannot skip or double-fire a run, so Phase 1 has no DST test for jobs. Later phases with
+local-time schedules (Phase 3 notifications) bring their own DST tests.

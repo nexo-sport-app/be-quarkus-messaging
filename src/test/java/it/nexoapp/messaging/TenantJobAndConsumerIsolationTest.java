@@ -15,6 +15,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.time.OffsetDateTime;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -48,6 +51,12 @@ class TenantJobAndConsumerIsolationTest {
 
     @Inject
     EntityManager em;
+
+    @Inject
+    EnvelopeCodec codec;
+
+    @Inject
+    ProbeSender sender;
 
     // -----------------------------------------------------------------------------------------------------------------
 
@@ -93,7 +102,7 @@ class TenantJobAndConsumerIsolationTest {
     // -----------------------------------------------------------------------------------------------------------------
 
     /**
-     * Counts, bypassing the tenant filter, the rows with a label that carry a tenant and an actor.
+     * Reads, bypassing the tenant filter, the tenant and the creator of the row with a label.
      *
      * @param label label of the row
      * @return the row columns {@code tenant_id} and {@code created_by} as strings, null when absent
@@ -226,6 +235,81 @@ class TenantJobAndConsumerIsolationTest {
         final long visible = runner.callForTenant("job-call", TENANT_A, repository::count);
 
         assertEquals(0, visible);
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Two-tenant job: a row seeded under tenant B is not seen by the job running for tenant A, and the row the job
+     * wrote under A is invisible under B.
+     */
+    @Test
+    void jobForTenantANeverSeesTenantBRowsAndItsRowIsInvisibleToB() {
+        seed(TENANT_B, "b-seed");
+        ProbeTenantJob.arm(TENANT_A, "job-a-isolation");
+
+        final ProbeTenantJob.Observation seen = awaitJob();
+
+        assertNull(seen.error());
+        assertEquals(0, seen.visibleBefore());
+        assertEquals(1, countAs(TENANT_A));
+        assertEquals(1, countAs(TENANT_B));
+        assertEquals(0, TenantContext.callAs(TENANT_B, () -> QuarkusTransaction.requiringNew().call(
+                () -> repository.count("label", "job-a-isolation"))));
+        assertEquals(0, TenantContext.callAs(TENANT_A, () -> QuarkusTransaction.requiringNew().call(
+                () -> repository.count("label", "b-seed"))));
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Builds an isolation envelope for the raw sender.
+     *
+     * @param tenant tenant of the envelope
+     * @return a new envelope of type {@code probe.isolation}
+     */
+    private static EventEnvelope isolationEnvelope(final UUID tenant) {
+        return new EventEnvelope(UUID.randomUUID(), "probe.isolation", 1, tenant, "call-isolation", "system:other",
+                OffsetDateTime.now(), "{}");
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Two-tenant consumer: the handler for tenant A counts zero of B's rows and writes one; that row is visible under A
+     * and invisible under B; a later envelope for B sees none of A's rows.
+     */
+    @Test
+    void consumerHandlerForTenantANeverSeesTenantBRowsAndItsRowIsInvisibleToB() {
+        seed(TENANT_B, "b-seed");
+        final Map<UUID, Long> visible = new ConcurrentHashMap<>();
+        sideEffects.register("probe.isolation", envelope -> {
+            visible.put(envelope.messageId(), repository.count());
+            repository.persist(new ProbeRecordEntity("consumer-" + (envelope.tenantId().equals(TENANT_A) ? "a" : "b")));
+        });
+        final EventEnvelope forA = isolationEnvelope(TENANT_A);
+
+        sender.send(codec.encode(forA));
+        Awaitility.await().atMost(Duration.ofSeconds(15)).until(() -> visible.containsKey(forA.messageId()));
+
+        assertEquals(0L, visible.get(forA.messageId()));
+        Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+            assertEquals(1, countAs(TENANT_A));
+            assertEquals(0, TenantContext.callAs(TENANT_B, () -> QuarkusTransaction.requiringNew().call(
+                    () -> repository.count("label", "consumer-a"))));
+        });
+        assertEquals("system:msg", rawRow("consumer-a")[1]);
+        assertEquals(TENANT_A.toString(), rawRow("consumer-a")[0]);
+
+        // an envelope for B, processed after the one for A, sees only B's own seed row and none of A's
+        final EventEnvelope forB = isolationEnvelope(TENANT_B);
+        sender.send(codec.encode(forB));
+        Awaitility.await().atMost(Duration.ofSeconds(15)).until(() -> visible.containsKey(forB.messageId()));
+
+        assertEquals(1L, visible.get(forB.messageId()));
+        assertEquals(0, TenantContext.callAs(TENANT_B, () -> QuarkusTransaction.requiringNew().call(
+                () -> repository.count("label", "consumer-a"))));
+        assertEquals(1, countAs(TENANT_A));
     }
 
 }
